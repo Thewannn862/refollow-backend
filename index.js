@@ -69,14 +69,13 @@ async function resolveCreatorFids() {
     console.log("Creator FIDs:", CREATOR_FIDS);
   } catch (e) {
     console.error("Failed to resolve creator fids", e);
-    // kalau gagal resolve, jangan kunci semua orang
     CREATOR_FIDS = [];
   }
 }
 
 resolveCreatorFids();
 
-// TIDAK pakai Quick Auth: fid dikirim dari frontend via query ?fid=
+// fid dikirim dari frontend via query ?fid=
 app.get("/refollow", async (req, res) => {
   try {
     const fid = String(req.query.fid || "").trim();
@@ -107,12 +106,9 @@ app.get("/refollow", async (req, res) => {
       if (typeof targetFid === "number") followingFids.add(targetFid);
     }
 
-    // cek: user harus follow KEDUA creator
+    // cek: user harus follow kedua creator
     if (CREATOR_FIDS.length > 0) {
-      const followsBoth =
-        CREATOR_FIDS.length > 0 &&
-        CREATOR_FIDS.every((c) => followingFids.has(c));
-
+      const followsBoth = CREATOR_FIDS.every((c) => followingFids.has(c));
       if (!followsBoth) {
         return res.status(403).json({
           error:
@@ -138,7 +134,7 @@ app.get("/refollow", async (req, res) => {
       if (!followersFids.has(f)) notFollowingBackFids.add(f);
     }
 
-    // 4) kumpulin semua FID untuk user/bulk
+    // 4) kumpulin semua FID
     const allFids = Array.from(
       new Set([...followingFids, ...followersFids, ...notFollowingBackFids])
     );
@@ -186,7 +182,10 @@ app.get("/refollow", async (req, res) => {
     res.json(data);
   } catch (e) {
     console.error("refollow error", e);
-    res.status(500).json({ error: "Failed to build refollow data" });
+    const message =
+      (e && typeof e === "object" && "message" in e && e.message) ||
+      "Failed to build refollow data";
+    res.status(500).json({ error: message });
   }
 });
 
