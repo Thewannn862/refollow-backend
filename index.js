@@ -11,14 +11,14 @@ const port = process.env.PORT || 8787;
 const NEYNAR_API_KEY = process.env.NEYNAR_API_KEY;
 
 if (!NEYNAR_API_KEY) {
-  console.error("Missing NEYNAR_API_KEY in .env");
+  console.error("Missing NEYNAR_API_KEY in .env / environment");
   process.exit(1);
 }
 
 app.use(
   cors({
-    origin: true,
-    credentials: true,
+    origin: true,       // miniapp host mana pun
+    credentials: true,  // biar cookie ke-set
   })
 );
 app.use(cookieParser());
@@ -27,9 +27,11 @@ app.get("/", (req, res) => {
   res.send("Refollow backend is running");
 });
 
-const CACHE_TTL_MS = 5 * 60 * 1000;
-const refollowCache = new Map();
+// cache sederhana di memory
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 menit
+const refollowCache = new Map();    // key: fid -> { data, updatedAt }
 
+// helper umum ke Neynar
 async function neynarFetch(path) {
   const url = `https://api.neynar.com${path}`;
   const res = await fetch(url, {
@@ -38,44 +40,67 @@ async function neynarFetch(path) {
       "Content-Type": "application/json",
     },
   });
+
   if (!res.ok) {
     const text = await res.text();
     console.error("Neynar error response:", text);
     throw new Error(`Neynar error ${res.status}: ${text}`);
   }
+
   return res.json();
 }
 
-// akun creator yang wajib di-follow
-const CREATOR_USERNAMES = ["sir-wannn", "tompenoz"];
-let CREATOR_FIDS = [];
+/**
+ * Ambil list FID untuk:
+ *  kind === "followers" -> orang yang follow kita
+ *  kind === "following" -> orang yang kita follow
+ *
+ * Pakai API baru Neynar:
+ *  - GET /v2/farcaster/followers/
+ *  - GET /v2/farcaster/following/
+ *
+ * Biar hemat kredit + simple, kita batasi max 3 page x 100 = 300 akun per sisi.
+ */
+async function fetchFollowFids(kind, fid) {
+  const fids = new Set();
+  let cursor = undefined;
+  const MAX_PAGES = 3;
+  let page = 0;
 
-// resolve FID creator sekali di awal
-async function resolveCreatorFids() {
-  try {
-    const resultFids = [];
-    for (const username of CREATOR_USERNAMES) {
-      const data = await neynarFetch(
-        `/v2/farcaster/user/by_username?username=${encodeURIComponent(
-          username
-        )}`
-      );
-      const user = data.user || data.result?.user;
-      if (user && typeof user.fid === "number") {
-        resultFids.push(user.fid);
+  while (page < MAX_PAGES) {
+    const params = new URLSearchParams();
+    params.set("fid", String(fid));
+    params.set("limit", "100");
+    if (cursor) params.set("cursor", cursor);
+
+    // contoh path: /v2/farcaster/followers/?fid=...&limit=100
+    const json = await neynarFetch(
+      `/v2/farcaster/${kind}/?${params.toString()}`
+    );
+
+    const users = json.users || json.result?.users || [];
+    for (const u of users) {
+      if (u && typeof u.fid === "number") {
+        fids.add(u.fid);
       }
     }
-    CREATOR_FIDS = resultFids;
-    console.log("Creator FIDs:", CREATOR_FIDS);
-  } catch (e) {
-    console.error("Failed to resolve creator fids", e);
-    CREATOR_FIDS = [];
+
+    const nextObj = json.next || json.result?.next;
+    const nextCursor = nextObj && (nextObj.cursor || nextObj);
+
+    if (!nextCursor) {
+      break;
+    }
+
+    cursor = nextCursor;
+    page += 1;
   }
+
+  return fids;
 }
 
-resolveCreatorFids();
-
-// fid dikirim dari frontend via query ?fid=
+// endpoint utama yang dipanggil miniapp
+// /refollow?fid=473291
 app.get("/refollow", async (req, res) => {
   try {
     const fid = String(req.query.fid || "").trim();
@@ -91,50 +116,26 @@ app.get("/refollow", async (req, res) => {
 
     const forceRefresh = req.query.refresh === "true";
 
+    // kalau ada cache dan nggak di-force refresh -> pakai cache
     if (!forceRefresh && cookieTs && hasFreshCache) {
       return res.json(cacheEntry.data);
     }
 
-    // 1) akun yang user follow
-    const linksByFid = await neynarFetch(
-      `/v1/linksByFid?fid=${fid}&link_type=follow`
-    );
+    // 1) orang yang KAMU FOLLOW
+    const followingFids = await fetchFollowFids("following", fid);
 
-    const followingFids = new Set();
-    for (const msg of linksByFid.messages || []) {
-      const targetFid = msg?.data?.linkBody?.targetFid;
-      if (typeof targetFid === "number") followingFids.add(targetFid);
-    }
+    // 2) orang yang FOLLOW KAMU
+    const followersFids = await fetchFollowFids("followers", fid);
 
-    // cek: user harus follow kedua creator
-    if (CREATOR_FIDS.length > 0) {
-      const followsBoth = CREATOR_FIDS.every((c) => followingFids.has(c));
-      if (!followsBoth) {
-        return res.status(403).json({
-          error:
-            "To use Refollow, please follow both @sir-wannn and @tompenoz on Farcaster, then try again.",
-        });
+    // 3) not-following-back = yang kamu follow, tapi dia nggak follow balik
+    const notFollowingBackFids = new Set();
+    for (const f of followingFids) {
+      if (!followersFids.has(f)) {
+        notFollowingBackFids.add(f);
       }
     }
 
-    // 2) akun yang follow user
-    const linksByTarget = await neynarFetch(
-      `/v1/linksByTargetFid?target_fid=${fid}&link_type=follow`
-    );
-
-    const followersFids = new Set();
-    for (const msg of linksByTarget.messages || []) {
-      const sourceFid = msg?.data?.fid;
-      if (typeof sourceFid === "number") followersFids.add(sourceFid);
-    }
-
-    // 3) not following back
-    const notFollowingBackFids = new Set();
-    for (const f of followingFids) {
-      if (!followersFids.has(f)) notFollowingBackFids.add(f);
-    }
-
-    // 4) kumpulin semua FID
+    // 4) gabung semua FID buat di-hydrate lewat /user/bulk
     const allFids = Array.from(
       new Set([...followingFids, ...followersFids, ...notFollowingBackFids])
     );
@@ -145,7 +146,11 @@ app.get("/refollow", async (req, res) => {
       const bulk = await neynarFetch(
         `/v2/farcaster/user/bulk?fids=${allFids.join(",")}`
       );
-      const users = Array.isArray(bulk.users) ? bulk.users : [];
+
+      const users = Array.isArray(bulk.users)
+        ? bulk.users
+        : bulk.result?.users || [];
+
       for (const u of users) {
         if (u && typeof u.fid === "number") {
           usersByFid.set(u.fid, u);
@@ -171,24 +176,24 @@ app.get("/refollow", async (req, res) => {
       notFollowingBack: buildList(notFollowingBackFids),
     };
 
+    // simpan cache
     refollowCache.set(fid, { data, updatedAt: now });
 
+    // set cookie buat throttle
     res.cookie("refollow_cache_ts", String(now), {
       maxAge: CACHE_TTL_MS,
       sameSite: "none",
-      secure: process.env.NODE_ENV === "production",
+      secure: true,
     });
 
     res.json(data);
   } catch (e) {
     console.error("refollow error", e);
-    const message =
-      (e && typeof e === "object" && "message" in e && e.message) ||
-      "Failed to build refollow data";
-    res.status(500).json({ error: message });
+    res.status(500).json({ error: "Failed to build refollow data" });
   }
 });
 
+// buat tombol Disconnect di miniapp
 app.post("/logout", (req, res) => {
   res.clearCookie("refollow_cache_ts");
   res.json({ ok: true });
